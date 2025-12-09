@@ -1,5 +1,7 @@
-#ifndef ALLOCATOR_H
-#define ALLOCATOR_H
+// Copyright 2025 Pip Martin-Yates
+
+#ifndef ALLOCATOR_H_
+#define ALLOCATOR_H_
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,4 +27,4 @@ void mm_heap_stats(void);
 void mm_heap_dump(int verbose);
 // debug helper: prints block layout and alignment
 
-#endif
+#endif  // ALLOCATOR_H_

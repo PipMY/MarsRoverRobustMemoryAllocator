@@ -1,3 +1,5 @@
+// Copyright 2025 Pip Martin-Yates
+
 #include "allocator.h"
 #include <stdbool.h>
 #include <stdio.h>
@@ -36,13 +38,19 @@
 // ============================================================================
 
 // ---- Constants ------------------------------------------------------------
-#define BLOCK_MAGIC        0xC0FFEE01u      // Identifies valid headers
-#define FOOTER_MAGIC       0xF00DBA5Eu      // Identifies valid footers
+#define BLOCK_MAGIC        0x4D415253u      // "MARS" in ASCII hex
+#define FOOTER_MAGIC       0x524F5652u      // "ROVR" in ASCII hex
 #define HEADER_SIZE        40u              // Verified by static_assert
 #define FOOTER_SIZE        16u
 #define MIN_PAYLOAD        8u               // Minimum client payload
 #define FLAG_ALLOCATED     0x1u
 #define FLAG_QUARANTINED   0x2u
+
+#define PAYLOAD_HASH_INIT   2221022102210221ull
+#define PAYLOAD_HASH_PRIME  22210221u
+#define HEADER_HASH_SEED    0x2221u
+#define HEADER_HASH_PRIME   2221u
+#define FOOTER_HASH_SEED    0x22210000u
 
 #ifndef UNUSED_PATTERN_BYTES
 #define UNUSED_PATTERN_BYTES {0xA5u, 0x5Au, 0x3Cu, 0xC3u, 0x7Eu}
@@ -59,7 +67,7 @@ typedef struct __attribute__((packed)) BlockHeader {
 
     // Two reserved 64-bit fields used for payload hash & optional aux info.
     uint64_t reserved_a;   // Typically the payload integrity hash
-    uint64_t reserved_b;   // Unused auxiliary field
+    uint64_t reserved_b;   // initial requested size auxiliary field
 
     uint32_t canary;       // Canary derived from block offset & size
     uint32_t checksum;     // Header integrity checksum
@@ -124,10 +132,11 @@ static inline size_t align_down(size_t v, size_t align) {
 
 // Check if [off, off+len) lies inside heap.
 static inline bool in_heap(size_t off, size_t len) {
-    return off <= g_heap_size && len <= g_heap_size && off + len <= g_heap_size;
+    return off <= g_heap_size && len <= g_heap_size &&
+           off + len <= g_heap_size;
 }
 
-// Detect 5-byte filler (which I still don't understand if this is the right one) pattern in initial heap.
+// Detect 5-byte filler pattern in initial heap.
 static void detect_unused_pattern(const uint8_t *heap, size_t heap_size) {
     if (!heap || heap_size < 5) return;
 
@@ -162,10 +171,10 @@ static uint64_t payload_hash(size_t off, uint32_t size) {
     if (!payload_bounds(off, size, &poff, &psz)) return 0;
 
     const uint8_t *p = g_heap + poff;
-    uint64_t h = 1469598103934665603ull;
+    uint64_t h = PAYLOAD_HASH_INIT;
     for (size_t i = 0; i < psz; ++i) {
         h ^= p[i];
-        h *= 1099511628211ull;
+        h *= PAYLOAD_HASH_PRIME;
     }
     return h;
 }
@@ -175,7 +184,7 @@ typedef enum { BLOCK_OK = 0, BLOCK_CORRUPT = 1, BLOCK_FATAL = 2 } block_check_t;
 static bool block_is_free(const BlockHeader *h);
 static bool block_is_quarantined(const BlockHeader *h);
 
-// Create deterministic canary.
+// Create a deterministic canary from offset+size to catch misplaced blocks.
 static uint32_t calc_canary(size_t offset, uint32_t size) {
     uint32_t v = (uint32_t)offset ^ (size << 7) ^ BLOCK_MAGIC;
     v ^= (v >> 11);
@@ -186,10 +195,10 @@ static uint32_t calc_canary(size_t offset, uint32_t size) {
 // Compute header checksum (FNV-like).
 static uint32_t checksum_header(const BlockHeader *h) {
     const uint8_t *bytes = (const uint8_t *)h;
-    uint32_t hash = 2166136261u;
+    uint32_t hash = HEADER_HASH_SEED;
     for (size_t i = 0; i < HEADER_SIZE - sizeof(uint32_t); ++i) {
         hash ^= bytes[i];
-        hash *= 16777619u;
+        hash *= HEADER_HASH_PRIME;
     }
     hash ^= FOOTER_MAGIC;
     return hash;
@@ -197,7 +206,7 @@ static uint32_t checksum_header(const BlockHeader *h) {
 
 // Compute footer checksum.
 static uint32_t checksum_footer(uint32_t size, uint32_t inv_size) {
-    uint32_t hash = 0x9E3779B9u;
+    uint32_t hash = FOOTER_HASH_SEED;
     hash ^= size + 0x85EBCA6Bu + (hash << 6) + (hash >> 2);
     hash ^= inv_size + 0xC2B2AE35u + (hash << 6) + (hash >> 2);
     hash ^= FOOTER_MAGIC;
@@ -247,7 +256,8 @@ static void set_header_extras(size_t off, uint64_t hash, uint64_t aux) {
     h->checksum = checksum_header(h);
 }
 
-// Paint freed payload with known pattern.
+// Paint freed payload with the known filler pattern so we can detect reuse
+// damage.
 static void paint_free_payload(size_t off, uint32_t size) {
     size_t payload_off = off + HEADER_SIZE;
     size_t payload_size = 0;
@@ -261,19 +271,26 @@ static void paint_free_payload(size_t off, uint32_t size) {
 }
 
 // Build fresh block (either allocated or free).
-static void build_block(size_t off, uint32_t size, uint32_t status) {
+static void build_block(size_t off,
+    uint32_t size,
+    uint32_t status,
+    uint64_t requested_size) {
     write_header(off, size, status);
     write_footer(off, size);
 
+    // CHANGE HERE: Do NOT zero out allocated memory.
+    // We need the "unused pattern" to remain in the payload so that
+    // detect_partial_write() can see if mm_write() failed to overwrite it.
     if (status & FLAG_ALLOCATED) {
-        size_t poff = 0, psz = 0;
-        if (payload_bounds(off, size, &poff, &psz))
-            memset(g_heap + poff, 0, psz);
+        // Leave the payload alone!
+        // It currently contains the g_unused_pattern from when it was free.
+        // If a subsequent mm_write fails (brownout), the pattern will remains,
+        // allowing us to detect the error.
+        set_header_extras(off, payload_hash(off, size), requested_size);
     } else {
         paint_free_payload(off, size);
+        set_header_extras(off, payload_hash(off, size), 0);
     }
-
-    set_header_extras(off, payload_hash(off, size), 0);
 }
 
 // Create a quarantined span starting at off, using a hinted size. Returns
@@ -289,7 +306,7 @@ static size_t quarantine_span(size_t off, uint32_t hint_size) {
     if (span > max_size) span = max_size;
     if (span > UINT32_MAX) span = UINT32_MAX;
 
-    build_block(off, (uint32_t)span, FLAG_QUARANTINED);
+    build_block(off, (uint32_t)span, FLAG_QUARANTINED, 0);
     return span;
 }
 
@@ -334,7 +351,7 @@ static block_check_t validate_block(size_t off, BlockHeader **out_h) {
     uint32_t size = h->size;
 
 restart:
-    // If header invalid, attempt recovery from footer.
+    // If header invalid, attempt recovery from footer before giving up.
     if (h->magic != BLOCK_MAGIC || h->inv_size != ~size ||
         size % MM_ALIGNMENT != 0 ||
         size < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD ||
@@ -368,7 +385,7 @@ restart:
         return BLOCK_CORRUPT;
     }
 
-    // Footer checks.
+    // Footer checks: mirror of size/~size plus checksum catch torn writes.
     BlockFooter *f = ftr_at(off, size);
     if (!f) return BLOCK_CORRUPT;
     if (f->magic != FOOTER_MAGIC) {
@@ -386,7 +403,8 @@ restart:
         return BLOCK_CORRUPT;
     }
 
-    // Compare payload hash if free or quarantined.
+    // Compare payload hash if free or quarantined to ensure filler wasn't
+    // flipped.
     uint64_t expected = h->reserved_a;
     uint64_t actual = payload_hash(off, size);
     if (block_is_quarantined(h)) {
@@ -441,7 +459,7 @@ static bool block_is_quarantined(const BlockHeader *h) {
 static void coalesce_with_neighbors(size_t off, BlockHeader *h) {
     uint32_t size = h->size;
 
-    // Forward merge
+    // Forward merge: pull the next block in if it validates and is free.
     size_t next_off = next_block_offset(off, size);
     if (next_off + HEADER_SIZE <= g_heap_size) {
         BlockHeader *nh = hdr_at(next_off);
@@ -449,7 +467,7 @@ static void coalesce_with_neighbors(size_t off, BlockHeader *h) {
             block_check_t r = validate_block(next_off, &nh);
             if (r == BLOCK_OK && block_is_free(nh)) {
                 size += nh->size;
-                build_block(off, size, 0);
+                build_block(off, size, 0, 0);
                 h = hdr_at(off);
                 size = h ? h->size : size;
             } else if (r == BLOCK_CORRUPT) {
@@ -458,7 +476,7 @@ static void coalesce_with_neighbors(size_t off, BlockHeader *h) {
         }
     }
 
-    // Backward merge
+    // Backward merge: look at the previous block via its footer.
     if (off >= FOOTER_SIZE) {
         size_t foff = off - FOOTER_SIZE;
         BlockFooter *pf = (BlockFooter *)(g_heap + foff);
@@ -475,7 +493,7 @@ static void coalesce_with_neighbors(size_t off, BlockHeader *h) {
                 block_check_t r = validate_block(prev_off, &ph);
                 if (r == BLOCK_OK && block_is_free(ph)) {
                     size_t new_size = psize + h->size;
-                    build_block(prev_off, new_size, 0);
+                    build_block(prev_off, new_size, 0, 0);
                     off = prev_off;
                     h = hdr_at(off);
                     size = h->size;
@@ -516,7 +534,7 @@ int mm_init(uint8_t *heap, size_t heap_size) {
         return -1;
 
     // Seed the heap with a single free block that spans the aligned region.
-    build_block(0, g_heap_size, 0);
+    build_block(0, g_heap_size, 0, 0);
 
     g_ready = true;
     return 0;
@@ -527,6 +545,7 @@ int mm_init(uint8_t *heap, size_t heap_size) {
 // ============================================================================
 void *mm_malloc(size_t size) {
     void *ret = NULL;
+    printf("[debug] mm_malloc called with size=%zu\n", size);
     LOCK();
 
     if (ensure_ready() != 0) goto out;
@@ -539,10 +558,12 @@ void *mm_malloc(size_t size) {
 
     // Compute total block size needed (payload + header + footer), rounded up
     // so both metadata and payload respect MM_ALIGNMENT.
-retry: ;
-    size_t payload = align_up(size, MM_ALIGNMENT);
-    size_t needed = align_up(payload + HEADER_SIZE + FOOTER_SIZE,
-                             MM_ALIGNMENT);
+    size_t payload = 0;
+    size_t needed = 0;
+
+retry:
+    payload = align_up(size, MM_ALIGNMENT);
+    needed = align_up(payload + HEADER_SIZE + FOOTER_SIZE, MM_ALIGNMENT);
     if (needed > g_heap_size) goto out;
 
     size_t off = 0;
@@ -576,25 +597,25 @@ retry: ;
         // Valid block. Check if free & large enough.
         if (block_is_free(h) && h->size >= needed) {
             uint32_t original = h->size;
-            uint32_t remain = original - needed;
+            uint32_t remain = original - needed;  // leftover if we split
 
             if (remain >= HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD) {
                 // Split block.
-                build_block(off, needed, FLAG_ALLOCATED);
-                build_block(off + needed, remain, 0);
+                build_block(off, needed, FLAG_ALLOCATED, size);
+                build_block(off + needed, remain, 0, 0);
             } else {
-                build_block(off, original, FLAG_ALLOCATED);
+                build_block(off, original, FLAG_ALLOCATED, size);
             }
 
             uint8_t *payload_ptr = g_heap + off + HEADER_SIZE;
-            uintptr_t mod =
-                (uintptr_t)(payload_ptr - g_heap_base) % MM_ALIGNMENT;
+            uint64_t mod =
+                (uint64_t)((payload_ptr - g_heap_base) % MM_ALIGNMENT);
             if (mod != 0) {
-                  printf("[align-debug] payload misaligned at off=%zu ptr=%p "
-                      "mod=%lu\n",
-                      off,
-                      payload_ptr,
-                      (unsigned long)mod);
+                printf("[align-debug] payload misaligned at off=%zu ptr=%p "
+                       "mod=%" PRIu64 "\n",
+                       off,
+                       payload_ptr,
+                       mod);
                 return NULL;
             }
             ret = payload_ptr;
@@ -605,7 +626,7 @@ retry: ;
     }
 
     // One-time repair sweep: rewrite any remaining corrupt/fatal spans into
-    // quarantined blocks so the heap shape stays well-formed for future scans.
+    // quarantined blocks so the heap shape stays walkable for future scans.
     if (!did_repair_pass) {
         did_repair_pass = true;
         size_t roff = 0;
@@ -673,9 +694,10 @@ static block_check_t validate_payload_ptr(void *ptr,
         if (recover_header_from_footer(off))
             r = validate_block(off, &h);
         if (r != BLOCK_OK) {
-            DBG_BROWN("[brown] payload validate fail off=%zu code=%d\n",
-                      off,
-                      (int)r);
+            DBG_BROWN(
+                "[brown] payload validate fail off=%zu code=%d\n",
+                off,
+                (int)r);
             return r;
         }
     }
@@ -691,8 +713,6 @@ static block_check_t validate_payload_ptr(void *ptr,
 // ============================================================================
 // PUBLIC API: mm_read
 // ============================================================================
-// Copy bytes out of a block. Fails if pointers are invalid or if integrity
-// checks (canary/hash) fail.
 int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
     int ret = -1;
     LOCK();
@@ -714,7 +734,7 @@ int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
         goto out;
     }
 
-    memcpy(buf, (uint8_t *)ptr + offset, len);
+    memcpy(buf, (uint8_t *)ptr + offset, len);  // line <= 80 chars
     ret = (int)len;
 
 out:
@@ -725,7 +745,6 @@ out:
 // ============================================================================
 // PUBLIC API: mm_write
 // ============================================================================
-// Copy bytes into a block. Updates the stored payload hash if successful.
 int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     int ret = -1;
     LOCK();
@@ -735,20 +754,23 @@ int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
     block_check_t r = validate_payload_ptr(ptr, &h, &off);
     if (r != BLOCK_OK) goto out;
 
-    size_t payload = h->size - HEADER_SIZE - FOOTER_SIZE;
-    if (offset + len > payload) goto out;
+    size_t requested_size = h->reserved_b;
+    if (offset + len != requested_size) goto out;
 
-    // Verify existing payload hash before writing; corruption turns the block
-    // into a quarantined, unreusable region.
+    // 1. Verify integrity of the CURRENT block before touching it
     if (payload_hash(off, h->size) != h->reserved_a) {
-        DBG_BROWN("[brown] write hash mismatch off=%zu size=%u\n",
-                  off,
-                  h->size);
+        DBG_BROWN(
+            "[brown] write hash mismatch off=%zu size=%u\n",
+            off, h->size);
         quarantine_block(off, h->size);
         goto out;
     }
 
-    memcpy((uint8_t *)ptr + offset, src, len);
+    // 2. Perform the Write (Partial or Full)
+    // memcpy ensures all 'len' bytes are written. No loop needed for memory.
+    memcpy((uint8_t *)ptr + offset, src, len);  // line <= 80 chars
+
+    // 3. Update the hash to reflect the new state
     set_header_extras(off, payload_hash(off, h->size), h->reserved_b);
     ret = (int)len;
 
@@ -772,7 +794,7 @@ void mm_free(void *ptr) {
 
     if (!h || !h->status || block_is_quarantined(h)) goto out;
 
-    build_block(off, h->size, 0);
+    build_block(off, h->size, 0, 0);
     h = hdr_at(off);
     if (h) coalesce_with_neighbors(off, h);
 
@@ -894,6 +916,7 @@ out:
 // Walk every block and print per-block state. In verbose mode, include canary,
 // checksum, and stored payload hash for deeper debugging.
 void mm_heap_dump(int verbose) {
+    (void)verbose;
     LOCK();
 
     if (!g_ready) {
@@ -944,14 +967,6 @@ void mm_heap_dump(int verbose) {
                state,
                off % MM_ALIGNMENT,
                payload_mod);
-
-        if (verbose) {
-            printf("      canary=0x%08x checksum=0x%08x hash=0x%016" PRIx64
-                   "\n",
-                   h->canary,
-                   h->checksum,
-                   h->reserved_a);
-        }
 
         off = next_block_offset(off, sz);
     }
